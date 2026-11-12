@@ -1,0 +1,15 @@
+# 嘉环声枢录音文件传输服务 —— 运行依赖
+
+# 本服务与 backend/ 完全独立，请在 filetransfer/ 下单独创建虚拟环境安装。
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12        # multipart/form-data 上传必需
+httpx>=0.27.0                   # 调用 Casdoor userinfo / introspect / JWKS
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+python-jose[cryptography]>=3.3.0  # JWT 本地验签模式（CASDOOR_VERIFY_METHOD=jwt 时用）
+python-dotenv>=1.0.1
+
+# 测试
+pytest>=8.3.0
+pytest-asyncio>=0.24.0

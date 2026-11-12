@@ -1,0 +1,17 @@
+# 机密配置
+.env
+
+# 上传文件与测试数据
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+
+# 日志
+*.log
