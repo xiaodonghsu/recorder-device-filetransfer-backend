@@ -10,7 +10,7 @@
 | 项目 | 本服务 `filetransfer/` | 现有 `backend/` |
 | --- | --- | --- |
 | 职责 | 录音文件上传 / 保存 / 列表 / 下载 / 删除 | 设备资产、领用、绑定、凭证、事件 |
-| 监听端口（建议） | `127.0.0.1:8050` | `127.0.0.1:8040` |
+| 监听端口（建议） | `127.0.0.1:8030` | `127.0.0.1:8040` |
 | 接口前缀 | `/voicehub-ogg` | `/voicehub-api` |
 | 配置文件 | `filetransfer/.env` | `backend/.env` |
 | 数据存储 | 本地文件系统（按工号分目录） | MySQL / SQLite |
@@ -23,7 +23,7 @@
 浏览器 ──> https://office.uassist.cn:40000
              ├── /voicehub/       → 管理后台静态资源（frontend/）
              ├── /voicehub-api/   → 设备管理后端 127.0.0.1:8040
-             └── /voicehub-ogg/   → 文件传输服务 127.0.0.1:8050
+             └── /voicehub-ogg/   → 文件传输服务 127.0.0.1:8030
 ```
 
 ---
@@ -63,17 +63,17 @@ python -m venv .venv
 source .venv/Scripts/activate        # Windows Git Bash；CMD 用 .venv\Scripts\activate.bat
 pip install -r requirements.txt
 cp .env.example .env                 # Windows: copy .env.example .env
-python -m app.main                   # 默认 http://127.0.0.1:8050
+uv run -m app.main                   # 默认 http://127.0.0.1:8030
 ```
 
-在线文档：<http://127.0.0.1:8050/voicehub-ogg/docs>
-存活探针：<http://127.0.0.1:8050/healthz>（根路径，内网 / 容器用）
-就绪探针：<http://127.0.0.1:8050/readyz>（检查存储目录可写）
+在线文档：<http://127.0.0.1:8030/voicehub-ogg/docs>
+存活探针：<http://127.0.0.1:8030/healthz>（根路径，内网 / 容器用）
+就绪探针：<http://127.0.0.1:8030/readyz>（检查存储目录可写）
 
 生产启动（由 systemd / supervisor 托管）：
 
 ```bash
-uvicorn app.main:app --host 127.0.0.1 --port 8050 --proxy-headers --workers 2
+uv run -m uvicorn app.main:app --host 127.0.0.1 --port 8030 --proxy-headers --workers 2
 ```
 
 > **Windows / Git Bash 陷阱**：不要用 `API_PREFIX=/voicehub-ogg python -m app.main`，
@@ -90,7 +90,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8050 --proxy-headers --workers 2
 | --- | --- | --- |
 | `API_PREFIX` | `/voicehub-ogg` | 服务自身监听的接口前缀 |
 | `DOCS_ENABLED` | `true` | 是否开放 docs / redoc / openapi.json |
-| `HOST` / `PORT` | `127.0.0.1` / `8050` | 仅 `python -m app.main` 本地开发使用 |
+| `HOST` / `PORT` | `127.0.0.1` / `8030` | 仅 `python -m app.main` 本地开发使用 |
 | `STORAGE_DIR` | `./data/uploads` | 文件根目录，相对路径以 `filetransfer/` 为基准 |
 | `MAX_UPLOAD_MB` | `100` | 单文件上限；nginx `client_max_body_size` 必须 ≥ 该值 |
 | `ALLOWED_EXTENSIONS` | `.ogg,.oga,.opus,.wav,.mp3,.m4a,.flac,.webm` | 扩展名白名单，`*` 表示不限制 |
@@ -273,7 +273,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 
 | 要点 | 说明 |
 | --- | --- |
-| `proxy_pass http://127.0.0.1:8050;` | **末尾不能带 URI / 斜杠**，否则前缀被剥离，全部 404 |
+| `proxy_pass http://127.0.0.1:8030;` | **末尾不能带 URI / 斜杠**，否则前缀被剥离，全部 404 |
 | `client_max_body_size 120m` | 必须 ≥ `MAX_UPLOAD_MB` + multipart 开销，否则 nginx 先返回非结构化 413 |
 | `proxy_request_buffering off` | 流式转发，避免 nginx 先把大文件完整缓存到磁盘 |
 | `proxy_read_timeout / send_timeout 300s` | 大文件上传耗时较长 |
@@ -293,7 +293,7 @@ curl -H "Authorization: Bearer $TOKEN" https://office.uassist.cn:40000/voicehub-
 
 ```bash
 docker build -t voicehub-ogg:1.0.0 -f filetransfer/Dockerfile filetransfer
-docker run -d --name voicehub-ogg -p 127.0.0.1:8050:8050 \
+docker run -d --name voicehub-ogg -p 127.0.0.1:8030:8030 \
   -v /srv/voicehub-ogg:/var/lib/voicehub-ogg \
   --env-file filetransfer/.env \
   voicehub-ogg:1.0.0
