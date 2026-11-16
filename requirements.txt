@@ -10,6 +10,12 @@ pydantic-settings>=2.6.0
 python-jose[cryptography]>=3.3.0  # JWT 本地验签模式（CASDOOR_VERIFY_METHOD=jwt 时用）
 python-dotenv>=1.0.1
 
+# 华为云 OBS 官方 SDK（STORAGE_BACKEND=obs 时必需）
+esdk-obs-python>=3.24.0
+# 上传文件元数据数据库（SQLite / MySQL）
+sqlalchemy>=2.0.30
+pymysql>=1.1.1             # MySQL 驱动；仅用 SQLite 时可不装
+
 # 测试
 pytest>=8.3.0
 pytest-asyncio>=0.24.0

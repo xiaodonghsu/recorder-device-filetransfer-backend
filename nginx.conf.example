@@ -8,7 +8,7 @@
 #    浏览器 ──> https://office.uassist.cn:40000
 #                ├── /voicehub/        → frontend/ 静态资源
 #                ├── /voicehub-api/    → 设备管理后端 127.0.0.1:8040
-#                └── /voicehub-ogg/    → 文件传输服务 127.0.0.1:8050  (本文件)
+#                └── /voicehub-ogg/    → 文件传输服务 127.0.0.1:8030  (本文件)
 # ============================================================================
 
 # 不带尾斜杠访问时补齐，避免页面里相对路径解析出错
@@ -28,9 +28,9 @@ location ^~ /voicehub-ogg/ {
     proxy_request_buffering   off;
 
     # ★ 关键：proxy_pass 末尾不带 URI（连斜杠都不能带），原样透传
-    #   /voicehub-ogg/upload → http://127.0.0.1:8050/voicehub-ogg/upload
-    # 若写成 proxy_pass http://127.0.0.1:8050/; 会剥离前缀 → 全部 404。
-    proxy_pass                http://127.0.0.1:8050;
+    #   /voicehub-ogg/upload → http://127.0.0.1:8030/voicehub-ogg/upload
+    # 若写成 proxy_pass http://127.0.0.1:8030/; 会剥离前缀 → 全部 404。
+    proxy_pass                http://127.0.0.1:8030;
     proxy_http_version        1.1;
 
     proxy_set_header          Host $host;

@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     docs_enabled: bool = True
     #: 仅 ``python -m app.main`` 本地开发时使用；生产请用 uvicorn 命令行指定。
     host: str = "127.0.0.1"
-    port: int = 8050
+    port: int = 8030
 
     # ---------------- 存储 ----------------
     #: 文件根目录。相对路径以 filetransfer/ 为基准解析。
@@ -53,6 +53,28 @@ class Settings(BaseSettings):
     overwrite_existing: bool = False
     upload_chunk_size: int = 64 * 1024
     max_list_items: int = 1000
+
+    # ---------------- 存储后端选择 ----------------
+    #: local = 本地文件系统；obs = 华为云 OBS（官方 esdk-obs-python SDK）
+    storage_backend: str = "local"
+
+    # ---------------- 华为云 OBS ----------------
+    obs_access_key_id: str = ""
+    obs_secret_access_key: str = ""
+    obs_server: str = "obs.cn-south-1.myhuaweicloud.com"
+    obs_bucket: str = "delocalization-public-files"
+    #: 桶内统一前缀，最终对象键为
+    #: {prefix}/{tenant_id}/{user_id}/{device_sn}/{subdir}/{filename}
+    obs_prefix: str = "voicehub/sounds"
+    #: OBS 没有真实目录；开启后会上传以 / 结尾的 0 字节对象，便于控制台按层级浏览
+    obs_create_folder: bool = True
+    obs_max_list_keys: int = 1000
+
+    # ---------------- 元数据数据库 ----------------
+    #: SQLite（相对路径以 filetransfer/ 为基准）或 MySQL：
+    #: mysql+pymysql://user:password@127.0.0.1:3306/voicehub_files?charset=utf8mb4
+    database_url: str = "sqlite:///./data/filetransfer.db"
+    db_echo: bool = False
 
     # ---------------- Casdoor ----------------
     #: Casdoor 实例配置了 authPrefix=auth，所有接口都在 /auth 之下。
@@ -124,6 +146,19 @@ class Settings(BaseSettings):
             raise ValueError("max_upload_mb 必须在 (0, 4096] 区间内")
         return v
 
+    @field_validator("storage_backend")
+    @classmethod
+    def _check_storage_backend(cls, v: str) -> str:
+        value = (v or "local").strip().lower()
+        if value not in {"local", "obs"}:
+            raise ValueError("storage_backend 必须为 local 或 obs")
+        return value
+
+    @field_validator("obs_prefix")
+    @classmethod
+    def _clean_obs_prefix(cls, v: str) -> str:
+        return "/".join(part for part in (v or "").strip().split("/") if part)
+
     # ---------------- 派生属性 ----------------
     @property
     def storage_path(self) -> Path:
@@ -151,6 +186,35 @@ class Settings(BaseSettings):
     def casdoor_has_client_credentials(self) -> bool:
         return bool(self.casdoor_client_id and self.casdoor_client_secret)
 
+    @property
+    def obs_has_credentials(self) -> bool:
+        return bool(self.obs_access_key_id and self.obs_secret_access_key)
+
+    @property
+    def obs_endpoint(self) -> str:
+        """SDK 需要带 scheme 的 endpoint；用户常只填域名，这里自动补全。"""
+        value = (self.obs_server or "").strip()
+        if not value.startswith(("http://", "https://")):
+            value = "https://" + value
+        return value.rstrip("/")
+
+    def resolved_database_url(self) -> str:
+        """把 SQLite 相对路径锚定到 filetransfer/，避免受启动 cwd 影响。
+
+        MySQL 连接串原样返回，由 SQLAlchemy / PyMySQL 处理。
+        """
+        url = (self.database_url or "").strip()
+        if not url.startswith("sqlite"):
+            return url
+        path = url[len("sqlite:///") :] if url.startswith("sqlite:///") else ""
+        if not path or path == ":memory:":
+            return url
+        # 已是绝对路径（Unix / 或 Windows 盘符）则保持不变
+        if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
+            return url
+        absolute = (BASE_DIR / path).resolve().as_posix()
+        return f"sqlite:///{absolute}"
+
     def validate_runtime(self) -> List[str]:
         """返回生产环境下的配置风险清单（空列表表示无风险项）。"""
         warnings: List[str] = []
@@ -168,6 +232,13 @@ class Settings(BaseSettings):
             warnings.append("DOCS_ENABLED=true，生产环境建议关闭在线接口文档")
         if "*" in self.extension_set:
             warnings.append("ALLOWED_EXTENSIONS=*，未限制上传文件类型")
+        if self.storage_backend == "obs":
+            if not self.obs_has_credentials:
+                warnings.append("STORAGE_BACKEND=obs 但未配置 OBS_ACCESS_KEY_ID / OBS_SECRET_ACCESS_KEY")
+            if not self.obs_bucket.strip():
+                warnings.append("OBS_BUCKET 未配置")
+        if self.database_url.startswith("sqlite"):
+            warnings.append("元数据数据库使用 SQLite；多实例 / 生产环境建议改用 MySQL")
         return warnings
 
 

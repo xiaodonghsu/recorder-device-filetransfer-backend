@@ -83,6 +83,14 @@ class StorageError(AppError):
     message = "文件存储异常"
 
 
+class RemoteStorageError(AppError):
+    """对象存储（华为云 OBS）调用失败。"""
+
+    status_code = 502
+    error_code = "remote_storage_error"
+    message = "远端对象存储异常"
+
+
 class CasdoorError(AppError):
     """Casdoor 交互异常：不可达 / 响应异常，与 Token 无效严格区分。"""
 

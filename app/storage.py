@@ -1,21 +1,29 @@
-"""按用户名隔离的文件存储层。
+"""存储层公共契约、路径安全与本地文件系统实现。
 
-目录布局（用户名由服务端从 Token 推导，客户端无法伪造）：
+两种后端共用同一套**归属口径**（租户与用户名由服务端从 Token 推导，设备 SN 由
+客户端声明后严格净化，三者共同构成不可伪造的存储根目录）：
 
 ```
-{STORAGE_DIR}/
-└── {username}/                 # Casdoor 工号 preferred_username
-    ├── 2026-11-12/             # 可选子目录（subdir 表单字段）
-    │   └── meeting-01.ogg
-    └── standup.ogg
+本地磁盘：{STORAGE_DIR}/{tenant_id}/{user_id}/{device_sn}/{subdir}/{filename}
+华为云 OBS：obs://{bucket}/{OBS_PREFIX}/{tenant_id}/{user_id}/{device_sn}/{subdir}/{filename}
 ```
+
+其中 ``user_id`` 取 Casdoor ``preferred_username``（工号）——沿用设备管理后端的
+业务约定；``device_sn`` 取录音卡 SN（如 ``VH-2026-0001``），使同一工号名下
+多台设备的录音互不混放。``subdir`` 是设备目录内的可选子目录，不传时文件直接
+落在 ``{tenant}/{user}/{sn}/{filename}``。
+
+对外暴露的 ``relpath`` 一律是**相对用户根目录**的完整路径，首段即设备 SN
+（``VH-2026-0001/2026-11-16/周会.ogg``），下载 / 删除 / 列表都用它定位，
+不需要额外传设备参数。
 
 安全边界（四道）：
 
-1. **净化**：用户名 / 文件名 / 子目录逐段白名单化，剥离路径分隔符、
-   控制字符、``.`` / ``..`` 与 Windows 保留设备名；
+1. **净化**：租户 / 用户名 / 设备 SN / 文件名 / 子目录逐段白名单化，剥离路径分隔符、
+   控制字符、``.`` / ``..`` 与 Windows 保留设备名；设备 SN 只允许
+   ``[A-Za-z0-9._-]``，出现其它字符直接 422 拒绝而不是猜测；
 2. **归属**：所有路径都从当前用户的根目录出发，不接受客户端传绝对/相对根路径；
-3. **落点校验**：``resolve()`` 后必须仍在用户根目录内（同时挡住符号链接逃逸）；
+3. **落点校验**：``resolve()`` 后必须仍在设备根目录内（同时挡住符号链接逃逸）；
 4. **原子写入**：先写同目录 ``.part`` 临时文件，流式分块 + 超限即删，
    完成后 ``os.replace`` 发布，下载方永远不会读到半截文件。
 """
@@ -26,7 +34,9 @@ import hashlib
 import mimetypes
 import os
 import re
-import uuid
+import tempfile
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -48,6 +58,10 @@ from app.schemas import FileInfo
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _UNSAFE_RE = re.compile(r"[^\w.\- ]", re.UNICODE)
 _MAX_NAME_LEN = 180
+#: 设备 SN 目录段：与 backend 的 device.sn（String(64)）同长，且只接受
+#: ASCII 字母数字与 . _ -，首字符必须是字母数字（避免隐藏目录 / 路径歧义）。
+_DEVICE_SN_MAX_LEN = 64
+_DEVICE_SN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
@@ -65,6 +79,9 @@ _MIME_FALLBACK = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 路径净化（本地与 OBS 共用）
+# ---------------------------------------------------------------------------
 def _avoid_reserved(name: str) -> str:
     """Windows 上 CON / COM1 等是设备名，直接写会失败或写到设备。"""
     stem = name.split(".", 1)[0].upper()
@@ -84,6 +101,38 @@ def clean_username(username: str) -> str:
     if not cleaned:
         raise ValidationError("身份中的用户名为空")
     return _avoid_reserved(cleaned)
+
+
+def clean_tenant(tenant_id: str, fallback: str) -> str:
+    """租户段：Token 未带组织时回退到配置值，但同样做路径净化。"""
+    parts = clean_path_segments((tenant_id or fallback or "").strip(), max_depth=1)
+    if not parts:
+        raise ValidationError("租户标识为空，无法隔离存储目录")
+    return parts[0]
+
+
+def clean_device_sn(raw: str) -> str:
+    """把录音卡 SN 转成安全的目录段；格式不合规一律 422 拒绝，不做猜测性替换。
+
+    与设备管理后端 ``device.sn``（String(64)）保持同一长度上限。只允许
+    ``[A-Za-z0-9._-]`` 且以字母/数字开头，因此不会出现路径分隔符、``..``、
+    控制字符或隐藏目录。大小写保持原样（SN 在业务库里是精确匹配口径）。
+    """
+    value = (raw or "").strip()
+    if not value:
+        raise ValidationError(
+            "缺少设备 SN，无法定位设备目录", details={"field": "device_sn"}
+        )
+    if (
+        len(value) > _DEVICE_SN_MAX_LEN
+        or _CONTROL_RE.search(value)
+        or not _DEVICE_SN_RE.fullmatch(value)
+    ):
+        raise ValidationError(
+            "设备 SN 格式非法：只允许字母、数字、点、下划线、连字符，且以字母或数字开头",
+            details={"device_sn": raw, "max_length": _DEVICE_SN_MAX_LEN},
+        )
+    return _avoid_reserved(value)
 
 
 def clean_filename(raw: str) -> str:
@@ -125,59 +174,239 @@ def clean_path_segments(raw: str, *, max_depth: int) -> List[str]:
     return parts
 
 
-class Storage:
-    """文件系统存储。所有公开方法都以 :class:`Identity` 为唯一归属依据。"""
+def ensure_within(root: Path, target: Path) -> Path:
+    resolved_root = root.resolve()
+    resolved = target.resolve()  # strict=False，不存在的路径也会被规范化
+    if not resolved.is_relative_to(resolved_root):
+        raise ValidationError("目标路径越出允许范围")
+    return resolved
+
+
+def check_extension(cfg: Settings, name: str) -> None:
+    allowed = cfg.extension_set
+    if "*" in allowed:
+        return
+    ext = Path(name).suffix.lower()
+    if ext not in allowed:
+        raise UnsupportedMediaTypeError(
+            f"不支持的文件扩展名 {ext or '(无)'}",
+            details={"filename": name, "allowed": sorted(allowed)},
+        )
+
+
+def content_type(name: str) -> str:
+    guessed = mimetypes.guess_type(name)[0]
+    return guessed or _MIME_FALLBACK.get(Path(name).suffix.lower(), "application/octet-stream")
+
+
+def build_relpath(cfg: Settings, device_sn: str, subdir: str, name: str) -> str:
+    """构造对外 ``relpath``：``{设备SN}/{subdir}/{name}``（相对用户根目录）。"""
+    sn = clean_device_sn(device_sn)
+    parts = clean_path_segments(subdir, max_depth=cfg.max_subdir_depth)
+    parts.append(name)
+    return "/".join([sn, *parts])
+
+
+def join_relpath(device_sn: str, parts: List[str]) -> str:
+    """把设备内路径段拼回对外 ``relpath``（首段始终是净化后的设备 SN）。"""
+    return "/".join([clean_device_sn(device_sn), *parts])
+
+
+def parse_relpath(cfg: Settings, relpath: str) -> Tuple[str, List[str]]:
+    """下载 / 删除共用：拆成 ``(设备SN, 设备内路径段)``。
+
+    ``relpath`` 首段必须是合法的设备 SN，其后至少要有文件名。禁止绝对路径、
+    ``.`` / ``..``、隐藏文件与 ``.part`` 临时文件。返回的第二段列表是相对
+    **设备目录**的路径，交给存储后端拼接根目录。
+    """
+    value = (relpath or "").strip().replace("\\", "/")
+    if value.startswith("/"):
+        raise ValidationError("不接受绝对路径")
+    pieces = [piece for piece in value.split("/") if piece != ""]
+    if len(pieces) < 2:
+        raise ValidationError(
+            "文件路径必须包含设备 SN 段（设备SN/文件名）",
+            details={"relpath": relpath},
+        )
+    sn = clean_device_sn(pieces[0])
+    inner = clean_path_segments(
+        "/".join(pieces[1:]), max_depth=cfg.max_subdir_depth + 1
+    )
+    if not inner:
+        raise ValidationError("请指定文件路径")
+    if inner[-1].startswith(".") or inner[-1].endswith(".part"):
+        raise NotFoundError("文件不存在或不可访问")
+    return sn, inner
+
+
+def make_file_info(
+    cfg: Settings,
+    identity: Identity,
+    *,
+    device_sn: str,
+    name: str,
+    relpath: str,
+    size: int,
+    sha256: str,
+    backend: str,
+    object_key: Optional[str] = None,
+    bucket: Optional[str] = None,
+    modified_at: Optional[str] = None,
+) -> FileInfo:
+    stamp = modified_at or datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return FileInfo(
+        name=name,
+        relpath=relpath,
+        device_sn=device_sn,
+        owner=identity.username,
+        size=size,
+        sha256=sha256,
+        content_type=content_type(name),
+        modified_at=stamp,
+        download_url=f"{cfg.api_prefix}/files/{quote(relpath, safe='/')}",
+        tenant_id=identity.tenant_id,
+        backend=backend,
+        object_key=object_key,
+        bucket=bucket,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 后端契约
+# ---------------------------------------------------------------------------
+@dataclass
+class SaveResult:
+    info: FileInfo
+    object_key: Optional[str] = None
+
+
+@dataclass
+class DownloadResult:
+    filename: str
+    content_type: str
+    size: int
+    #: 本地路径（本地后端直接指向正式文件；OBS 后端指向临时下载文件）
+    local_path: Optional[Path] = None
+    #: 响应结束后是否需要删除该临时文件
+    cleanup: bool = False
+
+
+class FileBackend(ABC):
+    """可插拔存储后端。列表统一由元数据数据库提供，后端只负责存取。"""
+
+    name: str = "base"
+
+    @abstractmethod
+    async def save(
+        self,
+        identity: Identity,
+        upload: UploadFile,
+        *,
+        device_sn: str,
+        filename=None,
+        subdir: str = "",
+    ) -> SaveResult: ...
+
+    @abstractmethod
+    async def download(self, identity: Identity, relpath: str) -> DownloadResult: ...
+
+    @abstractmethod
+    async def delete(self, identity: Identity, relpath: str) -> str: ...
+
+    @abstractmethod
+    async def ready(self) -> Tuple[bool, str]: ...
+
+    async def close(self) -> None:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 公共：把 multipart 流写成临时文件
+# ---------------------------------------------------------------------------
+async def write_upload_to_temp(
+    upload: UploadFile,
+    cfg: Settings,
+    *,
+    directory: Optional[Path] = None,
+) -> Tuple[Path, int, str]:
+    """分块流式接收，返回 ``(临时文件, 字节数, sha256)``。
+
+    ``directory`` 不为空时临时文件建在目标目录内，保证与最终文件同一卷，
+    ``os.replace`` 才能原子发布（Windows 跨盘 rename 会失败）。
+    OBS 后端不需要原子发布，用系统临时目录即可。
+    """
+    kwargs = {"prefix": ".voicehub-", "suffix": ".part"}
+    if directory is not None:
+        kwargs["dir"] = str(directory)
+    fd, raw = tempfile.mkstemp(**kwargs)
+    tmp = Path(raw)
+    size = 0
+    digest = hashlib.sha256()
+    limit = cfg.max_upload_bytes
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            while True:
+                chunk = await upload.read(cfg.upload_chunk_size)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    raise PayloadTooLargeError(
+                        f"文件超过 {cfg.max_upload_mb:g} MB 上限",
+                        details={"max_bytes": limit, "received_bytes": size},
+                    )
+                digest.update(chunk)
+                handle.write(chunk)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        await upload.close()
+    return tmp, size, digest.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# 本地文件系统后端
+# ---------------------------------------------------------------------------
+class LocalStorage(FileBackend):
+    """``{STORAGE_DIR}/{tenant_id}/{user_id}/{device_sn}/`` 布局。"""
+
+    name = "local"
 
     def __init__(self, cfg: Settings, root: Optional[Path] = None) -> None:
         self.cfg = cfg
         self.root = (root or cfg.storage_path).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # 路径
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _ensure_within(root: Path, target: Path) -> Path:
-        resolved_root = root.resolve()
-        resolved = target.resolve()  # strict=False，不存在的路径也会被规范化
-        if not resolved.is_relative_to(resolved_root):
-            raise ValidationError("目标路径越出允许范围")
-        return resolved
-
-    def user_root(self, username: str, *, create: bool = True) -> Path:
-        path = self.root / clean_username(username)
-        self._ensure_within(self.root, path)
+    def user_root(self, identity: Identity, *, create: bool = True) -> Path:
+        """用户根目录 ``{root}/{tenant}/{工号}``（不含设备层）。"""
+        tenant = clean_tenant(identity.tenant_id, self.cfg.casdoor_organization)
+        user = clean_username(identity.username)
+        path = self.root / tenant / user
+        ensure_within(self.root, path)
         if create:
             path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def _directory(self, user_root: Path, subdir: str, *, create: bool = True) -> Path:
-        parts = clean_path_segments(subdir, max_depth=self.cfg.max_subdir_depth)
-        target = user_root.joinpath(*parts) if parts else user_root
-        self._ensure_within(user_root, target)
+    def device_root(self, identity: Identity, device_sn: str, *, create: bool = True) -> Path:
+        """设备根目录 ``{user_root}/{设备SN}``，所有落盘都从这里出发。"""
+        sn = clean_device_sn(device_sn)
+        user_root = self.user_root(identity, create=create)
+        path = user_root / sn
+        ensure_within(user_root, path)
         if create:
-            target.mkdir(parents=True, exist_ok=True)
-        return target
+            path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def resolve_file(self, identity: Identity, relpath: str) -> Path:
-        """下载 / 删除共用：解析相对路径并确认归属，绝不越出用户目录。"""
-        parts = clean_path_segments(
-            relpath, max_depth=self.cfg.max_subdir_depth + 1
-        )
-        if not parts:
-            raise ValidationError("请指定文件路径")
-        if parts[-1].startswith(".") or parts[-1].endswith(".part"):
-            raise NotFoundError("文件不存在或不可访问")
-
-        user_root = self.user_root(identity.username, create=False)
-        resolved = self._ensure_within(user_root, user_root.joinpath(*parts))
+        """按 ``设备SN/子目录/文件名`` 定位；越界 / 隐藏 / .part 一律拒绝。"""
+        sn, parts = parse_relpath(self.cfg, relpath)
+        device_root = self.device_root(identity, sn, create=False)
+        resolved = ensure_within(device_root, device_root.joinpath(*parts))
         if not resolved.is_file():
             raise NotFoundError("文件不存在或不可访问")
         return resolved
 
-    # ------------------------------------------------------------------
-    # 写入
-    # ------------------------------------------------------------------
     @staticmethod
     def _available_name(directory: Path, name: str) -> str:
         if not (directory / name).exists():
@@ -189,138 +418,66 @@ class Storage:
                 return candidate
         raise StorageError("同名文件过多，请指定新的文件名")
 
-    def _check_extension(self, name: str) -> None:
-        allowed = self.cfg.extension_set
-        if "*" in allowed:
-            return
-        ext = Path(name).suffix.lower()
-        if ext not in allowed:
-            raise UnsupportedMediaTypeError(
-                f"不支持的文件扩展名 {ext or '(无)'}",
-                details={"filename": name, "allowed": sorted(allowed)},
-            )
-
     async def save(
         self,
         identity: Identity,
         upload: UploadFile,
         *,
+        device_sn: str,
         filename: Optional[str] = None,
         subdir: str = "",
-    ) -> FileInfo:
-        """流式接收文件并落到 ``{root}/{username}/{subdir}/``。
-
-        ``UploadFile`` 由 Starlette 落到 SpooledTemporaryFile，这里按块读取，
-        单请求内存占用恒定（约一个 chunk），适合几十 MB 的录音文件。
-        """
+    ) -> SaveResult:
+        sn = clean_device_sn(device_sn)  # 缺 SN / 非法 SN 直接 422，不建目录
         name = clean_filename(filename or upload.filename or "")
-        self._check_extension(name)
+        check_extension(self.cfg, name)
+        base_parts = clean_path_segments(subdir, max_depth=self.cfg.max_subdir_depth)
+        device_root = self.device_root(identity, sn)
+        directory = device_root.joinpath(*base_parts) if base_parts else device_root
+        ensure_within(device_root, directory)
+        directory.mkdir(parents=True, exist_ok=True)
 
-        user_root = self.user_root(identity.username)
-        directory = self._directory(user_root, subdir)
         final_name = name if self.cfg.overwrite_existing else self._available_name(directory, name)
-        final = self._directory_path(directory, final_name, user_root)
+        final = directory / final_name
+        ensure_within(device_root, final)
 
-        tmp = directory / f".{uuid.uuid4().hex}.part"
-        size = 0
-        digest = hashlib.sha256()
-        limit = self.cfg.max_upload_bytes
+        tmp, size, digest = await write_upload_to_temp(upload, self.cfg, directory=directory)
         try:
-            with tmp.open("xb") as handle:
-                while True:
-                    chunk = await upload.read(self.cfg.upload_chunk_size)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if size > limit:
-                        raise PayloadTooLargeError(
-                            f"文件超过 {self.cfg.max_upload_mb:g} MB 上限",
-                            details={"max_bytes": limit, "received_bytes": size},
-                        )
-                    digest.update(chunk)
-                    handle.write(chunk)
-            os.replace(tmp, final)  # 原子发布；同名并发时后者覆盖，见 README 说明
+            os.replace(tmp, final)  # 原子发布
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
-        finally:
-            await upload.close()
+        inner = final.relative_to(device_root).as_posix()
+        info = make_file_info(
+            self.cfg, identity, device_sn=sn, name=final_name,
+            relpath=f"{sn}/{inner}", size=size, sha256=digest, backend=self.name,
+        )
+        return SaveResult(info=info)
 
-        return self._file_info(identity, user_root, final, size=size, sha256=digest.hexdigest())
-
-    def _directory_path(self, directory: Path, name: str, user_root: Path) -> Path:
-        target = directory / name
-        self._ensure_within(user_root, target)
-        return target
-
-    # ------------------------------------------------------------------
-    # 读取 / 删除
-    # ------------------------------------------------------------------
-    def content_type(self, name: str) -> str:
-        guessed = mimetypes.guess_type(name)[0]
-        return guessed or _MIME_FALLBACK.get(Path(name).suffix.lower(), "application/octet-stream")
-
-    def _file_info(
-        self,
-        identity: Identity,
-        user_root: Path,
-        path: Path,
-        *,
-        size: Optional[int] = None,
-        sha256: str = "",
-    ) -> FileInfo:
-        stat = path.stat()
-        rel = path.relative_to(user_root).as_posix()
-        modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(
-            timespec="seconds"
-        ).replace("+00:00", "Z")
-        return FileInfo(
-            name=path.name,
-            relpath=rel,
-            owner=identity.username,
-            size=size if size is not None else stat.st_size,
-            sha256=sha256,
-            content_type=self.content_type(path.name),
-            modified_at=modified,
-            download_url=f"{self.cfg.api_prefix}/files/{quote(rel, safe='/')}",
+    async def download(self, identity: Identity, relpath: str) -> DownloadResult:
+        path = self.resolve_file(identity, relpath)
+        return DownloadResult(
+            filename=path.name,
+            content_type=content_type(path.name),
+            size=path.stat().st_size,
+            local_path=path,
+            cleanup=False,
         )
 
-    def list_files(self, identity: Identity, subdir: str = "") -> List[FileInfo]:
-        user_root = self.user_root(identity.username, create=False)
-        if not user_root.is_dir():
-            return []
-        base = self._directory(user_root, subdir, create=False)
-        if not base.is_dir():
-            return []
-
-        items: List[FileInfo] = []
-        for path in base.rglob("*"):
-            if not path.is_file() or path.name.startswith(".") or path.suffix == ".part":
-                continue
-            try:
-                self._ensure_within(user_root, path)
-                items.append(self._file_info(identity, user_root, path))
-            except (ValidationError, OSError):
-                # 跳过逃逸的符号链接 / 读取失败的文件，不影响整体列表
-                continue
-        items.sort(key=lambda item: item.modified_at, reverse=True)
-        return items[: self.cfg.max_list_items]
-
-    def delete(self, identity: Identity, relpath: str) -> str:
+    async def delete(self, identity: Identity, relpath: str) -> str:
+        sn, _ = parse_relpath(self.cfg, relpath)
         path = self.resolve_file(identity, relpath)
-        user_root = self.user_root(identity.username, create=False)
-        rel = path.relative_to(user_root).as_posix()
+        device_root = self.device_root(identity, sn, create=False)
+        rel = f"{sn}/{path.relative_to(device_root).as_posix()}"
         try:
             path.unlink()
         except OSError as exc:
             raise StorageError(f"删除文件失败: {exc}") from exc
         return rel
 
-    def ready(self) -> Tuple[bool, str]:
-        """就绪探针：存储根目录必须可写。"""
+    async def ready(self) -> Tuple[bool, str]:
         if not self.root.is_dir():
             return False, "存储目录不存在"
-        probe = self.root / f".readyz-{uuid.uuid4().hex}"
+        probe = self.root / f".readyz-{os.urandom(8).hex()}"
         try:
             probe.write_bytes(b"ok")
             probe.unlink()

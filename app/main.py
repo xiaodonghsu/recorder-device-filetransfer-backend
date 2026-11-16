@@ -27,8 +27,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.api import router
 from app.auth import CasdoorVerifier
 from app.config import settings
+from app.db import FileRepository
 from app.errors import AppError, AuthenticationError, PayloadTooLargeError
-from app.storage import Storage
+from app.storage import FileBackend, LocalStorage
+from app.storage_obs import ObsStorage
 
 logging.basicConfig(
     level=logging.DEBUG if settings.debug else logging.INFO,
@@ -53,20 +55,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     for item in settings.validate_runtime():
         logger.warning("配置风险提示：%s", item)
 
-    storage = Storage(settings)
+    repository = FileRepository(settings)
+    backend: FileBackend = (
+        ObsStorage(settings) if settings.storage_backend == "obs" else LocalStorage(settings)
+    )
     http_client = httpx.AsyncClient(
         timeout=settings.casdoor_timeout,
         verify=settings.casdoor_verify_tls,
         follow_redirects=True,
     )
     verifier = CasdoorVerifier(settings, http_client)
-    app.state.storage = storage
+    app.state.backend = backend
+    app.state.repository = repository
     app.state.http_client = http_client
     app.state.verifier = verifier
     logger.info(
-        "服务已就绪：prefix=%s, storage=%s, casdoor=%s, verify_method=%s",
+        "服务已就绪：prefix=%s, backend=%s, database=%s, casdoor=%s, verify_method=%s",
         PREFIX,
-        storage.root,
+        backend.name,
+        repository.engine.url.render_as_string(hide_password=True),
         settings.casdoor_base_url,
         settings.casdoor_verify_method,
     )
@@ -75,8 +82,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         await verifier.aclose()
         await http_client.aclose()
+        await backend.close()
+        repository.close()
         app.state.verifier = None
-        app.state.storage = None
+        app.state.backend = None
+        app.state.repository = None
 
 
 app = FastAPI(
@@ -85,8 +95,14 @@ app = FastAPI(
     description=(
         "嘉环声枢录音卡录音文件传输服务（独立部署）。\n\n"
         "**认证**：所有业务接口需要 `Authorization: Bearer <Casdoor Access Token>`；"
-        "服务端校验通过后按工号（`preferred_username`）隔离存储目录，"
+        "服务端校验通过后按 `租户 / 工号`（`preferred_username`）/ `设备 SN` 三级隔离存储，"
         "客户端无法指定或访问其他用户的文件。\n\n"
+        "**上传**：multipart 表单必须带 `device_sn`（录音卡 SN），它是用户目录下的"
+        "一级目录；`subdir` 是设备目录内的可选子目录。下载 / 删除用"
+        "`设备SN/子目录/文件名` 形式的 `relpath` 直接定位。\n\n"
+        "**存储后端**：`STORAGE_BACKEND=local` 本地磁盘，或 `obs` 华为云 OBS（官方 SDK）；"
+        "每次上传的文件名、对象键、大小、SHA-256 等元数据登记在 SQLite / MySQL，"
+        "列表接口直接读数据库。\n\n"
         "**部署**：路由自带 `/voicehub-ogg` 前缀，nginx 原样透传。"
     ),
     lifespan=lifespan,
@@ -198,16 +214,25 @@ async def healthz() -> dict:
     return {"status": "ok", "app": settings.app_name, "version": settings.app_version}
 
 
-@app.get("/readyz", tags=["运维"], summary="就绪探针（检查存储目录可写）", include_in_schema=False)
+@app.get("/readyz", tags=["运维"], summary="就绪探针（检查存储与数据库）", include_in_schema=False)
 async def readyz(request: Request) -> JSONResponse:
-    storage: Storage = getattr(request.app.state, "storage", None) or Storage(settings)
-    ok, reason = storage.ready()
+    backend: FileBackend = getattr(request.app.state, "backend", None)
+    repository: FileRepository = getattr(request.app.state, "repository", None)
+    if backend is None or repository is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "storage": "服务未初始化", "database": "服务未初始化"},
+        )
+    storage_ok, storage_reason = await backend.ready()
+    db_ok, db_reason = repository.ready()
+    ok = storage_ok and db_ok
     return JSONResponse(
         status_code=200 if ok else 503,
         content={
             "status": "ready" if ok else "unavailable",
-            "storage": reason,
-            "root": str(storage.root),
+            "backend": backend.name,
+            "storage": storage_reason,
+            "database": db_reason,
         },
     )
 

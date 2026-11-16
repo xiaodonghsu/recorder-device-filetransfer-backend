@@ -13,4 +13,9 @@ dependencies = [
     "python-jose[cryptography]>=3.5.0",
     "python-multipart>=0.0.12",
     "uvicorn[standard]>=0.32.0",
+    # 华为云 OBS 官方 SDK（STORAGE_BACKEND=obs）
+    "esdk-obs-python>=3.24.0",
+    # 上传文件元数据数据库（SQLite / MySQL）
+    "sqlalchemy>=2.0.30",
+    "pymysql>=1.1.1",
 ]

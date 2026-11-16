@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,16 +25,24 @@ os.environ["CASDOOR_VERIFY_METHOD"] = "auto"
 os.environ["ALLOW_QUERY_TOKEN"] = "false"
 os.environ["MAX_UPLOAD_MB"] = "100"
 os.environ["ALLOWED_EXTENSIONS"] = ".ogg,.wav,.mp3"
+os.environ["STORAGE_BACKEND"] = "local"
+os.environ["OBS_PREFIX"] = "voicehub/sounds"
+# 默认库指向系统临时目录；实际测试全部 override 到 tmp_path 的独立 SQLite。
+# 这样即使意外走到 fallback，也不会在项目里生成 data/*.db。
+os.environ["DATABASE_URL"] = "sqlite:///" + (
+    Path(tempfile.gettempdir()) / "voicehub-ogg-test-fallback.db"
+).as_posix()
 
 import httpx
 import pytest
 
-from app.api import get_storage
+from app.api import get_backend, get_repository
 from app.auth import Identity, get_verifier
 from app.config import settings
+from app.db import FileRepository
 from app.errors import AuthenticationError, CasdoorError
 from app.main import app
-from app.storage import Storage
+from app.storage import LocalStorage
 
 ALICE = Identity(
     user_id="uuid-alice",
@@ -91,18 +100,33 @@ def bob() -> Identity:
 
 
 @pytest.fixture
-def storage(tmp_path: Path) -> Storage:
-    return Storage(settings, root=tmp_path / "uploads")
+def backend(tmp_path: Path) -> LocalStorage:
+    return LocalStorage(settings, root=tmp_path / "uploads")
+
+
+@pytest.fixture
+def storage(backend: LocalStorage) -> LocalStorage:
+    """既有测试沿用的别名。"""
+    return backend
+
+
+@pytest.fixture
+def repository(tmp_path: Path) -> FileRepository:
+    url = "sqlite:///" + (tmp_path / "meta.db").as_posix()
+    return FileRepository(settings, url=url)
 
 
 @pytest.fixture(autouse=True)
-def _overrides(storage: Storage):
-    app.dependency_overrides[get_storage] = lambda: storage
+def _overrides(backend: LocalStorage, repository: FileRepository):
+    app.dependency_overrides[get_backend] = lambda: backend
+    app.dependency_overrides[get_repository] = lambda: repository
     app.dependency_overrides[get_verifier] = lambda: FakeVerifier()
-    app.state.storage = storage
+    app.state.backend = backend
+    app.state.repository = repository
     yield
     app.dependency_overrides.clear()
-    app.state.storage = None
+    app.state.backend = None
+    app.state.repository = None
 
 
 @pytest.fixture
