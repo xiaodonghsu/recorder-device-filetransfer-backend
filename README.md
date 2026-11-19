@@ -543,7 +543,7 @@ docker stop recorder-device-filetransfer-backend
 
 docker rm recorder-device-filetransfer-backend
 
-docker run --volume=C:\Files\Documents\Projects\playground-recorder\recorder-device-filetransfer-backend\data:/var/lib/voicehub-ogg -p 8030:8030 -d recorder-device-filetransfer-backend:latest
+docker run -d --name recorder-device-filetransfer-backend --volume=C:\Files\Documents\Projects\playground-recorder\recorder-device-filetransfer-backend\data:/var/lib/voicehub-ogg -p 8030:8030  recorder-device-filetransfer-backend:latest
 
 ```
 
