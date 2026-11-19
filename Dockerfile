@@ -13,8 +13,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /srv/filetransfer
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
+COPY .env .env
 COPY app ./app
 
 # 上传文件必须落在挂载卷上，避免容器重建丢数据
