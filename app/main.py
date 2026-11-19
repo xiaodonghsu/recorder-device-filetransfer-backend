@@ -103,6 +103,9 @@ app = FastAPI(
         "**存储后端**：`STORAGE_BACKEND=local` 本地磁盘，或 `obs` 华为云 OBS（官方 SDK）；"
         "每次上传的文件名、对象键、大小、SHA-256 等元数据登记在 SQLite / MySQL，"
         "列表接口直接读数据库。\n\n"
+        "**标签**：上传表单可带 `tags`（逗号分隔，中英文逗号均可）为文件打标签；"
+        "`PUT /files/{relpath}/tags` 整体覆盖标签（传空数组清空）；"
+        "`GET /files?tag=xxx` 按单个标签筛选。标签只存元数据、不进入存储路径。\n\n"
         "**部署**：路由自带 `/voicehub-ogg` 前缀，nginx 原样透传。"
     ),
     lifespan=lifespan,

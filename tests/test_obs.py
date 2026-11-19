@@ -417,6 +417,47 @@ async def test_obs_remote_failure_is_502_and_not_recorded(
 
 
 # ---------------------------------------------------------------------------
+# 标签（两种后端共用；OBS 侧不产生额外对象操作）
+# ---------------------------------------------------------------------------
+async def test_obs_tags_are_metadata_only(
+    make_client, obs_backend, obs_client, repository, alice
+):
+    async with make_client() as client:
+        created = await client.post(
+            f"{PREFIX}/upload",
+            headers=auth(ALICE_TOKEN),
+            data=upload_data(tags="会议,重要"),
+            files=upload_files(),
+        )
+        assert created.status_code == 201
+        info = created.json()["file"]
+        assert info["tags"] == ["会议", "重要"]
+        assert info["object_key"] == KEY
+
+        data_calls = [
+            c for c in obs_client.calls
+            if c[0] in {"putFile", "getObject", "deleteObject"}
+        ]
+        updated = await client.put(
+            f"{PREFIX}/files/{SN_A}/meeting.ogg/tags",
+            headers=auth(ALICE_TOKEN),
+            json={"tags": ["归档"]},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["tags"] == ["归档"]
+        assert updated.json()["object_key"] == KEY
+        assert [
+            c for c in obs_client.calls if c[0] in {"putFile", "getObject", "deleteObject"}
+        ] == data_calls                                    # 改标签不碰对象
+
+        listed = await client.get(
+            f"{PREFIX}/files?tag=归档", headers=auth(ALICE_TOKEN)
+        )
+    assert listed.json()["total"] == 1
+    assert repository.get_active(alice, f"{SN_A}/meeting.ogg", "obs").tags == ["归档"]
+
+
+# ---------------------------------------------------------------------------
 # 配置 / 数据库纯函数
 # ---------------------------------------------------------------------------
 def test_repository_soft_delete_and_backend_filter(repository, alice):

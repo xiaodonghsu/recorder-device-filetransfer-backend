@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     upload_chunk_size: int = 64 * 1024
     max_list_items: int = 1000
 
+    # ---------------- 文件标签 ----------------
+    #: 单个文件最多标签数（去重后）；超出 422，不做静默截断。
+    max_tags_per_file: int = 20
+    #: 单个标签最大字符数；超出 422。
+    max_tag_length: int = 32
+
     # ---------------- 存储后端选择 ----------------
     #: local = 本地文件系统；obs = 华为云 OBS（官方 esdk-obs-python SDK）
     storage_backend: str = "local"
@@ -153,6 +159,20 @@ class Settings(BaseSettings):
         if value not in {"local", "obs"}:
             raise ValueError("storage_backend 必须为 local 或 obs")
         return value
+
+    @field_validator("max_tags_per_file")
+    @classmethod
+    def _check_max_tags_per_file(cls, v: int) -> int:
+        if v < 1 or v > 100:
+            raise ValueError("max_tags_per_file 必须在 [1, 100] 区间内")
+        return v
+
+    @field_validator("max_tag_length")
+    @classmethod
+    def _check_max_tag_length(cls, v: int) -> int:
+        if v < 1 or v > 128:
+            raise ValueError("max_tag_length 必须在 [1, 128] 区间内")
+        return v
 
     @field_validator("obs_prefix")
     @classmethod

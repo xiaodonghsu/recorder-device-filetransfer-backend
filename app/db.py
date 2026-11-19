@@ -1,8 +1,8 @@
 """上传文件元数据数据库（SQLite / MySQL）。
 
 两种存储后端（本地磁盘、华为云 OBS）都在这里登记同一份索引：
-文件名、租户、工号、**设备 SN**、相对路径、OBS 对象键、大小、SHA-256、MIME、状态与时间。
-后续业务（ASR、会议纪要、知识库）只需查这张表即可定位文件，
+文件名、租户、工号、**设备 SN**、相对路径、OBS 对象键、大小、SHA-256、MIME、
+标签、状态与时间。后续业务（ASR、会议纪要、知识库）只需查这张表即可定位文件，
 不必再扫描磁盘或遍历 OBS 前缀。
 
 - SQLite：``DATABASE_URL=sqlite:///./data/filetransfer.db``（相对 filetransfer/）
@@ -27,6 +27,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     create_engine,
     select,
     text,
@@ -37,6 +38,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from app.config import Settings
 from app.schemas import FileInfo
 from app.storage import clean_device_sn, clean_path_segments
+from app.tags import decode_tags, encode_tags
 
 
 def utcnow() -> datetime:
@@ -82,9 +84,21 @@ class FileRecord(Base):
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     content_type: Mapped[str] = mapped_column(String(128), nullable=False, default="application/octet-stream")
+    #: 标签元数据：物理列名 tags，存 JSON 数组文本（SQLite / MySQL 通用）。
+    #: 不参与任何存储路径，故不影响 relpath / 对象键契约。
+    tags_json: Mapped[str] = mapped_column("tags", Text, nullable=False, default="[]")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    @property
+    def tags(self) -> List[str]:
+        """以字符串列表形式读写标签；持久化时由 setter 转 JSON。"""
+        return decode_tags(self.tags_json)
+
+    @tags.setter
+    def tags(self, value: List[str]) -> None:
+        self.tags_json = encode_tags(value)
 
     __table_args__ = (
         Index("ix_ft_file_owner", "tenant_id", "username", "device_sn", "backend", "status"),
@@ -121,6 +135,7 @@ class FileRepository:
         object_key: Optional[str] = None,
         backend: str = "local",
         bucket: Optional[str] = None,
+        tags: Optional[List[str]] = None,
     ) -> FileRecord:
         """登记一次上传；覆盖同一设备下的同名文件时，先把旧记录标记为 deleted。"""
         now = utcnow()
@@ -150,6 +165,7 @@ class FileRepository:
                 size_bytes=info.size,
                 sha256=info.sha256 or "",
                 content_type=info.content_type,
+                tags_json=encode_tags(tags or []),
                 status="active",
                 created_at=now,
             )
@@ -176,16 +192,41 @@ class FileRepository:
             session.commit()
             return result.rowcount or 0
 
+    def update_tags(
+        self, identity, relpath: str, backend: str, tags: List[str]
+    ) -> Optional[FileRecord]:
+        """整体覆盖一条 active 记录的标签；找不到（含跨用户 / 跨设备）返回 None。
+
+        只改元数据，不触碰存储后端，也不改 ``relpath`` / 对象键 / 文件内容。
+        """
+        with self._Session() as session:
+            stmt = select(FileRecord).where(
+                FileRecord.tenant_id == identity.tenant_id,
+                FileRecord.username == identity.username,
+                FileRecord.device_sn == sn_from_relpath(relpath),
+                FileRecord.backend == backend,
+                FileRecord.relpath == relpath,
+                FileRecord.status == "active",
+            )
+            record = session.execute(stmt).scalars().first()
+            if record is None:
+                return None
+            record.tags_json = encode_tags(tags)
+            session.commit()
+            session.refresh(record)
+            return record
+
     # ------------------------------------------------------------------
     # 查询
     # ------------------------------------------------------------------
     def list_active(
-        self, identity, backend: str, subdir: str = "", device_sn: str = ""
+        self, identity, backend: str, subdir: str = "", device_sn: str = "", tag: str = ""
     ) -> List[FileRecord]:
         """列当前用户在该后端下仍有效的文件。
 
         ``device_sn`` 非空时只列该设备（同一工号多台设备互不串数据）；
         ``subdir`` 是**设备目录内**的子目录前缀，用内存过滤避免 LIKE 通配符歧义。
+        ``tag`` 非空时只列包含该标签的记录（标签存 JSON 文本，同样在内存过滤）。
         """
         with self._Session() as session:
             stmt = (
@@ -199,8 +240,10 @@ class FileRepository:
             )
             if device_sn:
                 stmt = stmt.where(FileRecord.device_sn == clean_device_sn(device_sn))
+            # 内存过滤前多取一些，避免刚好多命中的记录在 limit 之外被漏掉。
+            fetch_multiplier = 10 if tag else 2
             stmt = stmt.order_by(FileRecord.created_at.desc(), FileRecord.id.desc()).limit(
-                max(self.cfg.max_list_items * 2, 2000)
+                max(self.cfg.max_list_items * fetch_multiplier, 2000)
             )
             rows = list(session.execute(stmt).scalars())
 
@@ -211,6 +254,8 @@ class FileRepository:
                 if inner_relpath(r.relpath) == prefix
                 or inner_relpath(r.relpath).startswith(prefix + "/")
             ]
+        if tag:
+            rows = [r for r in rows if tag in r.tags]
         return rows[: self.cfg.max_list_items]
 
     def get_active(self, identity, relpath: str, backend: str) -> Optional[FileRecord]:
@@ -243,6 +288,7 @@ class FileRepository:
             bucket=record.bucket,
             record_id=record.id,
             uploaded_at=stamp,
+            tags=record.tags,
         )
 
     # ------------------------------------------------------------------

@@ -5,8 +5,9 @@
 >
 > 文件存储支持 **本地磁盘** 与 **华为云 OBS**（官方 Python SDK）两种后端，按
 > `租户 / 用户名(工号) / 设备SN` 三级隔离；同一员工名下多台录音卡各占一个设备目录，
-> 录音互不混放。每次上传的文件名、设备 SN、对象键、大小、摘要等元数据登记在自有
-> **SQLite / MySQL** 数据库中。
+> 录音互不混放。每次上传的文件名、设备 SN、对象键、大小、摘要、**标签**等元数据
+> 登记在自有 **SQLite / MySQL** 数据库中。标签可用上传表单指定、后续整体覆盖修改，
+> 并按标签筛选文件；它只存元数据，不参与目录 / 对象键命名。
 >
 > **版本约定（2026-11-16 起）**：设备 SN 是强制的一级目录，旧的 `租户/工号/` 两级布局**不做兼容**，
 > 不提供迁移、双写或旧路径回退（见 §12.1）。
@@ -50,14 +51,16 @@ filetransfer/
 │   ├── auth.py         # Casdoor Token 校验 + 身份依赖（工号 / 组织）
 │   ├── storage.py      # 后端契约、设备 SN / 路径净化、公共流式写入、LocalStorage
 │   ├── storage_obs.py  # 华为云 OBS 后端（esdk-obs-python 官方 SDK）
-│   ├── db.py           # SQLAlchemy 模型 + FileRepository（SQLite / MySQL，含设备 SN 列）
-│   ├── schemas.py      # 响应模型
+│   ├── tags.py         # 标签解析 / 归一化 / JSON 序列化（与路径无关）
+│   ├── db.py           # SQLAlchemy 模型 + FileRepository（SQLite / MySQL，含设备 SN / tags 列）
+│   ├── schemas.py      # 响应模型 + 标签修改请求模型
 │   ├── api.py          # HTTP 路由（不含前缀），串联存储与元数据
 │   └── main.py         # 应用入口、lifespan、早拒绝中间件、CORS、探针
 ├── tests/              # 离线测试（假 Casdoor 校验器 + 假 OBS 客户端）
 │   ├── conftest.py
 │   ├── test_api.py
-│   └── test_obs.py
+│   ├── test_obs.py
+│   └── test_tags.py    # 标签上传 / 修改 / 筛选 / 隔离 / 校验
 ├── pyproject.toml / uv.lock     # uv 依赖管理（uv sync / uv run）
 ├── requirements.txt            # pip 部署备选
 ├── .env.example        # 参数说明；实际 .env 已创建且被忽略
@@ -124,6 +127,8 @@ uv run -m uvicorn app.main:app --host 127.0.0.1 --port 8030 --proxy-headers --wo
 | `MAX_SUBDIR_DEPTH` | `3` | `subdir` 最大层数（位于设备 SN 目录之内） |
 | `OVERWRITE_EXISTING` | `false` | 同名是否覆盖；否则自动追加 `-1` / `-2` |
 | `MAX_LIST_ITEMS` | `1000` | 列表接口单用户返回上限 |
+| `MAX_TAGS_PER_FILE` | `20` | 单文件最多标签数（去重后），超限 422 |
+| `MAX_TAG_LENGTH` | `32` | 单个标签最大字符数，超限 422 |
 | **`STORAGE_BACKEND`** | `local` | `local` 本地磁盘 / `obs` 华为云 OBS |
 | **`OBS_ACCESS_KEY_ID`** | 空 | 华为云 AK（机密，只放 `.env`） |
 | **`OBS_SECRET_ACCESS_KEY`** | 空 | 华为云 SK（机密，只放 `.env`） |
@@ -182,8 +187,9 @@ DATABASE_URL=mysql+pymysql://user:password@127.0.0.1:3306/voicehub_files?charset
 | --- | --- | --- | --- |
 | `GET` | `/voicehub-ogg/healthz` | 存活探针（可经 nginx 访问，无需令牌） | 200 |
 | `GET` | `/voicehub-ogg/me` | 查看当前 Token 解析出的身份（排障用） | 200 |
-| `POST` | `/voicehub-ogg/upload` | 上传文件，`multipart/form-data`，**必填 `device_sn`** | 201 |
-| `GET` | `/voicehub-ogg/files?device_sn=&subdir=` | 从**元数据数据库**列出当前租户/工号的文件，可按设备筛选 | 200 |
+| `POST` | `/voicehub-ogg/upload` | 上传文件，`multipart/form-data`，**必填 `device_sn`**，可选 `tags` | 201 |
+| `GET` | `/voicehub-ogg/files?device_sn=&subdir=&tag=` | 从**元数据数据库**列出当前租户/工号的文件，可按设备 / 子目录 / 标签叠加筛选 | 200 |
+| `PUT` | `/voicehub-ogg/files/{设备SN}/{子目录}/{文件名}/tags` | **整体覆盖**修改文件标签（传空数组清空），只改元数据 | 200 |
 | `GET` | `/voicehub-ogg/files/{设备SN}/{子目录}/{文件名}` | 下载自己的文件 | 200 |
 | `DELETE` | `/voicehub-ogg/files/{设备SN}/{子目录}/{文件名}` | 删除自己的文件 + 数据库软删除 | 200 |
 | `GET` | `/healthz`、`/readyz` | 根路径探针（内网 / 容器，无需令牌） | 200 / 503 |
@@ -198,6 +204,12 @@ DATABASE_URL=mysql+pymysql://user:password@127.0.0.1:3306/voicehub_files?charset
 | **`device_sn`** | **是** | **录音卡设备 SN**（如 `VH-2026-0001`），用户目录下的强制一级目录；缺失或格式非法返回 422 |
 | `filename` | 否 | 自定义落盘文件名；不传用上传时的文件名。**都会做安全净化** |
 | `subdir` | 否 | **设备目录内**的子目录，如 `2026-11-12/meeting`，最多 3 层；不传则文件直接落在设备目录下 |
+| `tags` | 否 | **文件标签**，多个用逗号分隔（`,` 与 `，` 均可），如 `会议,重要,客户A`；空项与重复项自动忽略，超限 422 |
+
+标签只是元数据，**不参与目录 / 对象键 / `relpath` 命名**；不传则 `tags: []`。
+去重后超过 `MAX_TAGS_PER_FILE`、单个超过 `MAX_TAG_LENGTH`、含控制字符一律 422，
+且在写盘之前校验 —— 不会出现「文件已落盘但请求失败」。覆盖同名文件时新记录以本次
+上传的标签为准，不继承旧记录。
 
 ```bash
 TOKEN="<Casdoor Access Token>"
@@ -206,7 +218,8 @@ curl -X POST "https://office.uassist.cn:40000/voicehub-ogg/upload" \
   -F "file=@meeting.ogg" \
   -F "device_sn=VH-2026-0001" \
   -F "subdir=2026-11-12" \
-  -F "filename=周会.ogg"
+  -F "filename=周会.ogg" \
+  -F "tags=会议,重要，客户A"
 ```
 
 响应（201，`STORAGE_BACKEND=obs` 时的示例）：
@@ -230,7 +243,8 @@ curl -X POST "https://office.uassist.cn:40000/voicehub-ogg/upload" \
     "object_key": "voicehub/sounds/bestlink/JH000059/VH-2026-0001/2026-11-12/周会.ogg",
     "bucket": "delocalization-public-files",
     "record_id": 42,
-    "uploaded_at": "2026-11-12T08:01:02Z"
+    "uploaded_at": "2026-11-12T08:01:02Z",
+    "tags": ["会议", "重要", "客户A"]
   }
 }
 ```
@@ -287,6 +301,44 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 | `storage_error` | 500 | 本地磁盘写入失败 / OBS 配置缺失 |
 | `remote_storage_error` | 502 | 华为云 OBS 调用失败（权限、网络、桶不存在） |
 | `casdoor_error` | 502 | Casdoor 不可达或响应异常（**不是**令牌无效） |
+
+### 5.3 标签：修改与筛选
+
+**修改标签**用 `PUT`，请求体是**完整标签列表（整体覆盖）**，不是增量追加；
+传 `[]` 即清空。路径与下载 / 删除同一口径，首段必须是设备 SN：
+
+```bash
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tags": ["会议", "重要"]}' \
+  "https://office.uassist.cn:40000/voicehub-ogg/files/VH-2026-0001/2026-11-12/%E5%91%A8%E4%BC%9A.ogg/tags"
+```
+
+响应 200，返回更新后的完整 `FileInfo`（`relpath` / `download_url` / `object_key` /
+`record_id` 均不变）：
+
+```json
+{
+  "name": "周会.ogg",
+  "relpath": "VH-2026-0001/2026-11-12/周会.ogg",
+  "tags": ["会议", "重要"],
+  "record_id": 42
+}
+```
+
+要点：
+
+- **只改元数据**：不调用存储后端、不搬文件、不改对象键，因此本地 / OBS 两种后端行为一致；
+- **隔离**：租户、工号、设备 SN、后端、未删除五条件同时命中才更新；别人的文件、
+  别的设备、已删除记录、不存在的路径一律 404（不泄漏存在性）；
+- **校验**：与上传完全一致（去空白、丢空项、去重、数量 / 长度 / 控制字符），非法返回 422；
+- **筛选**：`GET /files?tag=会议` 只列含该标签的文件，可与 `device_sn`、`subdir` 叠加。
+  只接受单个标签，逗号分隔多值返回 422；响应体 `tag` 字段回显本次筛选条件。
+
+| code | HTTP | 标签相关原因 |
+| --- | --- | --- |
+| `validation_error` | 422 | 标签超数量 / 超长 / 含控制字符；`tag` 筛选传了多个值 |
+| `not_found` | 404 | 修改标签时文件不存在、已删除或不属于当前用户 / 设备 |
 
 ---
 
@@ -439,16 +491,20 @@ SDK 是同步阻塞客户端，所有网络调用都放在 `asyncio.to_thread` �
 | `backend` / `bucket` | VARCHAR | `local` / `obs`、OBS 桶名 |
 | `size_bytes` / `sha256` | BIGINT / VARCHAR(64) | 大小与内容摘要 |
 | `content_type` | VARCHAR(128) | 按扩展名推断的 MIME |
+| `tags` | TEXT | **文件标签**，JSON 数组文本（如 `["会议","重要"]`）；空为 `[]`，不参与路径 |
 | `status` / `created_at` / `deleted_at` | — | 软删除状态与时间（naive UTC） |
 
 行为约定：
 
-- **上传**：后端保存成功 → 写一条 `active` 记录（含 `device_sn`）；覆盖同名时先把
+- **上传**：后端保存成功 → 写一条 `active` 记录（含 `device_sn` 与 `tags`）；覆盖同名时先把
   **同一设备下**的旧记录标记为 `deleted` 保留历史。
 - **列表**：`GET /files` 直接读数据库，按 `(tenant_id, username, backend, status=active)`
   过滤，带 `device_sn` 时再叠加设备条件，因此切换后端不会串出另一后端的文件、
-  也不会串出别的设备；`subdir` 按**设备内相对路径**用内存前缀过滤，避免 LIKE 通配符歧义。
-- **删除**：删除后端对象 + 数据库软删除（含设备 SN 条件），历史可审计。
+  也不会串出别的设备；`subdir` 按**设备内相对路径**用内存前缀过滤，`tag` 按 JSON
+  数组内容内存过滤（多取一批再截断），避免 LIKE 通配符歧义。
+- **修改标签**：`PUT /files/{relpath}/tags` 命中唯一 active 记录后整体覆盖 `tags` 列，
+  不产生新记录、不改 `relpath`，也不触碰存储后端。
+- **删除**：删除后端对象 + 数据库软删除（含设备 SN 条件），历史可审计（标签随记录保留）。
 - **索引**：`ix_ft_file_owner(tenant_id, username, device_sn, backend, status)`。
 - **就绪**：`/readyz` 同时执行存储后端探针与 `SELECT 1`。
 - **连接串**：SQLite 相对路径自动锚定到 `filetransfer/`，不受启动 cwd 影响；
@@ -500,7 +556,7 @@ cd filetransfer
 uv run python -m pytest        # 或：pytest
 ```
 
-**54 passed**。离线运行：假 Casdoor 校验器 + 假 OBS 客户端 + `tmp_path` 独立 SQLite，
+**71 passed**。离线运行：假 Casdoor 校验器 + 假 OBS 客户端 + `tmp_path` 独立 SQLite，
 不联网、不碰生产桶、不写真实 `data/`。
 
 覆盖：无令牌 / 无效令牌、按 `租户/工号/设备SN` 落盘、设备 SN 必填与 10 类非法值、
@@ -509,7 +565,11 @@ uv run python -m pytest        # 或：pytest
 列表 / 下载 / 删除的用户隔离、跨组织拒绝、Casdoor 不可达 502；
 OBS 对象键规则、四级目录对象创建与按设备缓存、假 SDK 上传/下载/删除闭环、
 远端失败 502 且不入库、数据库 `device_sn` 列 / 软删除 / 后端隔离、
-SQLite 与 MySQL URL 解析、OpenAPI 中 `device_sn` 为必填字段。
+SQLite 与 MySQL URL 解析、OpenAPI 中 `device_sn` 为必填字段；
+标签上传（中英文逗号 / 去重 / 去空）、无标签默认空数组、写盘前 422 校验、
+整体覆盖与清空、改标签不动对象 / 文件、跨用户 / 跨设备 / 已删除 404、
+请求体校验、按标签筛选与叠加设备、标签隔离、OBS 后端标签不产生额外对象操作、
+OpenAPI 标签契约。
 
 ---
 
@@ -523,7 +583,8 @@ SQLite 与 MySQL URL 解析、OpenAPI 中 `device_sn` 为必填字段。
 | 审计 | 应用日志 + 上传/删除记录 | 下载行为写独立审计表或日志流 |
 | 内容校验 | 只校验扩展名与大小 | 可加 magic number 校验、病毒扫描、服务端加密 |
 | 目录大小写 | Windows 大小写不敏感 | Linux 上若 Token 工号大小写不一致会生成两个目录，建议统一大写 |
-| 与业务数据关联 | 记录含 `tenant_id` / `username` / `device_sn` / `sha256` | 后续可把 `object_key` 写回设备管理后端做录音归属 |
+| 与业务数据关联 | 记录含 `tenant_id` / `username` / `device_sn` / `sha256` / `tags` | 后续可把 `object_key` 写回设备管理后端做录音归属，或用标签驱动 ASR 分流 |
+| 标签筛选 | 标签存 JSON 文本，筛选在内存做（多取一批再截断） | 数据量上来后若需高频 / 多标签组合检索，改独立 `ft_file_tag` 关联表 + 索引 |
 | 数据库迁移 | 启动时 `create_all()` 幂等建表 | 表结构演进建议接入 Alembic（本次升级需重建表，见 §12.1） |
 | 匿名枚举风险 | `CASDOOR_REQUIRE_ORGANIZATION` 校验组织 | Token 不含 `owner` 时会回退配置值并在日志告警，见 §6 |
 | 设备 SN 归属 | 只做格式净化，**不校验**该 SN 是否领用给当前工号 | 需要强归属时由 APP 先过 `/my/devices`，或本服务调用业务后端核验 |
@@ -549,3 +610,18 @@ SQLite 与 MySQL URL 解析、OpenAPI 中 `device_sn` 为必填字段。
    搬目录 / 拷对象并按 `设备SN/文件名` 重新登记元数据。
 
 > 上述 3、4 均为一次性运维动作，代码里**不保留**任何兼容分支。
+
+### 12.2 新增标签列的升级说明（不做自动迁移）
+
+标签功能给 `ft_file_record` 增加了 `tags TEXT NOT NULL DEFAULT '[]'` 列。
+`Base.metadata.create_all()` **不会给已存在的表加列**，因此已有库需手工执行一次：
+
+```sql
+-- SQLite / MySQL 通用
+ALTER TABLE ft_file_record ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+```
+
+旧记录的标签读作空数组 `[]`（`decode_tags` 对空串 / 脏数据也退化为 `[]`，不会 500），
+不影响下载 / 删除 / 列表。不需要重建目录或搬对象，历史 OBS 对象键与本地文件路径均不变。
+
+> 若选择干脆重建库表，则需按 §12.1 第 4 条重新登记历史文件；代码里不保留迁移分支。

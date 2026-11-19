@@ -27,6 +27,9 @@ class FileInfo(BaseModel):
     bucket: Optional[str] = Field(None, description="OBS 桶名；本地后端为空")
     record_id: Optional[int] = Field(None, description="元数据数据库记录 ID")
     uploaded_at: Optional[str] = Field(None, description="上传入库时间，UTC ISO-8601")
+    tags: List[str] = Field(
+        default_factory=list, description="文件标签（元数据，与存储路径无关，可后续修改）"
+    )
 
 
 class UploadResponse(BaseModel):
@@ -42,7 +45,14 @@ class FileListResponse(BaseModel):
     device_sn: Optional[str] = Field(
         None, description="本次列表的设备 SN 筛选条件；为空表示列出该用户名下所有设备"
     )
+    tag: Optional[str] = Field(None, description="本次列表的标签筛选条件；为空表示不按标签过滤")
     items: List[FileInfo]
+
+
+class TagsUpdateRequest(BaseModel):
+    """修改标签请求体：整体覆盖，不是增量追加。"""
+
+    tags: List[str] = Field(..., description="完整标签列表；传空数组表示清空标签")
 
 
 class MessageResponse(BaseModel):
