@@ -537,11 +537,14 @@ curl -H "Authorization: Bearer $TOKEN" https://office.uassist.cn:40000/voicehub-
 ## 10. Docker（可选）
 
 ```bash
-docker build -t voicehub-ogg:1.0.0 -f filetransfer/Dockerfile filetransfer
-docker run -d --name voicehub-ogg -p 127.0.0.1:8030:8030 \
-  -v /srv/voicehub-ogg:/var/lib/voicehub-ogg \
-  --env-file filetransfer/.env \
-  voicehub-ogg:1.0.0
+docker build -t recorder-device-filetransfer-backend .
+
+docker stop recorder-device-filetransfer-backend
+
+docker rm recorder-device-filetransfer-backend
+
+docker run --volume=C:\Files\Documents\Projects\playground-recorder\recorder-device-filetransfer-backend\data:/var/lib/voicehub-ogg -p 8030:8030 -d recorder-device-filetransfer-backend:latest
+
 ```
 
 镜像内 `STORAGE_DIR=/var/lib/voicehub-ogg`、SQLite 库也在该卷下，务必挂载卷。
