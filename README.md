@@ -139,7 +139,7 @@ uv run -m uvicorn app.main:app --host 127.0.0.1 --port 8030 --proxy-headers --wo
 | `OBS_MAX_LIST_KEYS` | `1000` | 运维列举对象时的单页上限 |
 | **`DATABASE_URL`** | `sqlite:///./data/filetransfer.db` | SQLite；相对路径以 `filetransfer/` 为基准 |
 | `DB_ECHO` | `false` | 是否打印 SQL |
-| `CASDOOR_BASE_URL` | `https://office.uassist.cn:40000/auth` | 带 `/auth` 前缀 |
+| `CASDOOR_BASE_URL` | `https://uassist.cn/auth` | 2026-11-26 起的新认证端，带 `/auth` 前缀 |
 | `CASDOOR_CLIENT_ID` | `6932b8ce0b655b9421b5` | 公开标识符，已内置默认值 |
 | `CASDOOR_CLIENT_SECRET` | 空 | 机密，仅 `introspect` 模式需要 |
 | `CASDOOR_ORGANIZATION` | `bestlink` | 组织名即 tenant_id，与设备管理后端一致 |

@@ -84,7 +84,7 @@ class Settings(BaseSettings):
 
     # ---------------- Casdoor ----------------
     #: Casdoor 实例配置了 authPrefix=auth，所有接口都在 /auth 之下。
-    casdoor_base_url: str = "https://office.uassist.cn:40000/auth"
+    casdoor_base_url: str = "https://uassist.cn/auth"
     casdoor_issuer: str = ""
     #: clientId 是公开标识符（前端 OAuth 跳转里会出现），可安全内置默认值。
     casdoor_client_id: str = "6932b8ce0b655b9421b5"
